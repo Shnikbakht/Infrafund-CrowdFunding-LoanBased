@@ -72,6 +72,9 @@ contract IdentitySoulboundToken is ERC721URIStorage, AccessControl {
     // Maps platform addresses to whether they're registered
     mapping(address => bool) public registeredPlatforms;
     
+    // List of registered platforms to iterate through
+    address[] private _registeredPlatformsList;
+    
     // Maps document hash to whether it's been used
     mapping(bytes32 => bool) public usedDocumentHashes;
     
@@ -97,16 +100,16 @@ contract IdentitySoulboundToken is ERC721URIStorage, AccessControl {
      */
     function _update(address to, uint256 tokenId, address auth) 
     internal virtual override returns (address from) 
-{
-    from = super._update(to, tokenId, auth);
-    
-    // If this is a transfer (not a mint or burn)
-    if (from != address(0) && to != address(0)) {
-        revert("IdentitySoulboundToken: tokens are soulbound and cannot be transferred");
+    {
+        from = super._update(to, tokenId, auth);
+        
+        // If this is a transfer (not a mint or burn)
+        if (from != address(0) && to != address(0)) {
+            revert("IdentitySoulboundToken: tokens are soulbound and cannot be transferred");
+        }
+        
+        return from;
     }
-    
-    return from;
-}
     
     /**
      * @dev Registers a platform that can use these verification tokens
@@ -114,7 +117,21 @@ contract IdentitySoulboundToken is ERC721URIStorage, AccessControl {
      */
     function registerPlatform(address platformAddress) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(platformAddress != address(0), "Invalid platform address");
+        require(!registeredPlatforms[platformAddress], "Platform already registered");
+        
         registeredPlatforms[platformAddress] = true;
+        _registeredPlatformsList.push(platformAddress);
+        
+        // Update existing verifications to include this platform
+        // This ensures backward compatibility for existing users
+        // NOTE: In production systems with many tokens, you might want to make this
+        // a separate function that can be called as needed to save gas
+        for (uint256 i = 0; i < _tokenIdCounter; i++) {
+            if (_ownerOf(i) != address(0)) {
+                verifications[i].allowedPlatforms.push(platformAddress);
+            }
+        }
+        
         emit PlatformRegistered(platformAddress);
     }
     
@@ -124,7 +141,19 @@ contract IdentitySoulboundToken is ERC721URIStorage, AccessControl {
      */
     function removePlatform(address platformAddress) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(registeredPlatforms[platformAddress], "Platform not registered");
+        
         registeredPlatforms[platformAddress] = false;
+        
+        // Remove from the list of registered platforms
+        for (uint i = 0; i < _registeredPlatformsList.length; i++) {
+            if (_registeredPlatformsList[i] == platformAddress) {
+                // Replace with the last element and pop
+                _registeredPlatformsList[i] = _registeredPlatformsList[_registeredPlatformsList.length - 1];
+                _registeredPlatformsList.pop();
+                break;
+            }
+        }
+        
         emit PlatformRemoved(platformAddress);
     }
     
@@ -253,85 +282,67 @@ contract IdentitySoulboundToken is ERC721URIStorage, AccessControl {
     /**
      * @dev Internal function to issue verification credentials
      */
-
-function _issueVerification(
-    address recipient,
-    ParticipantType participantType,
-    string calldata jurisdiction,
-    bytes32 documentHash,
-    uint64 expirationDate,
-    uint32 investmentLimitUSD,
-    RiskTolerance riskTolerance,
-    AccreditationStatus accreditationStatus,
-    string calldata tokenURI
-) internal returns (uint256) {
-    require(recipient != address(0), "Recipient cannot be zero address");
-    require(bytes(jurisdiction).length > 0, "Jurisdiction cannot be empty");
-    require(documentHash != bytes32(0), "Document hash cannot be empty");
-    require(!usedDocumentHashes[documentHash], "Document hash already used");
-    
-    if (expirationDate != 0) {
-        require(expirationDate > block.timestamp, "Expiration date must be in the future");
+    function _issueVerification(
+        address recipient,
+        ParticipantType participantType,
+        string calldata jurisdiction,
+        bytes32 documentHash,
+        uint64 expirationDate,
+        uint32 investmentLimitUSD,
+        RiskTolerance riskTolerance,
+        AccreditationStatus accreditationStatus,
+        string calldata tokenURI
+    ) internal returns (uint256) {
+        require(recipient != address(0), "Recipient cannot be zero address");
+        require(bytes(jurisdiction).length > 0, "Jurisdiction cannot be empty");
+        require(documentHash != bytes32(0), "Document hash cannot be empty");
+        require(!usedDocumentHashes[documentHash], "Document hash already used");
+        
+        if (expirationDate != 0) {
+            require(expirationDate > block.timestamp, "Expiration date must be in the future");
+        }
+        
+        // Mark the document hash as used
+        usedDocumentHashes[documentHash] = true;
+        
+        // Mint a new token (manual counter increment)
+        uint256 tokenId = _tokenIdCounter;  // Get the current token ID
+        _tokenIdCounter++;  // Increment the counter manually
+        
+        _mint(recipient, tokenId);  // Mint the new token
+        
+        // Set token URI if provided
+        if (bytes(tokenURI).length > 0) {
+            _setTokenURI(tokenId, tokenURI);
+        }
+        
+        // Create verification data
+        VerificationData storage data = verifications[tokenId];
+        data.participantType = participantType;
+        data.verificationDate = uint64(block.timestamp);
+        data.expirationDate = expirationDate;
+        data.jurisdiction = jurisdiction;
+        data.documentHash = documentHash;
+        data.investmentLimitUSD = investmentLimitUSD;
+        data.riskTolerance = riskTolerance; 
+        data.accreditationStatus = accreditationStatus;
+        data.isSanctioned = false;
+        
+        // Add all current registered platforms
+        for (uint i = 0; i < _registeredPlatformsList.length; i++) {
+            address platformAddress = _registeredPlatformsList[i];
+            if (registeredPlatforms[platformAddress]) {
+                data.allowedPlatforms.push(platformAddress);
+            }
+        }
+        
+        // Map the address to the token ID
+        addressToTokenIds[recipient].push(tokenId);
+        
+        emit ParticipantVerified(tokenId, recipient, participantType);
+        
+        return tokenId;
     }
-    
-    // Mark the document hash as used
-    usedDocumentHashes[documentHash] = true;
-    
-    // Mint a new token (manual counter increment)
-    uint256 tokenId = _tokenIdCounter;  // Get the current token ID
-    _tokenIdCounter++;  // Increment the counter manually
-    
-    _mint(recipient, tokenId);  // Mint the new token
-    
-    // Set token URI if provided
-    if (bytes(tokenURI).length > 0) {
-        _setTokenURI(tokenId, tokenURI);
-    }
-    
-    // Create verification data
-    VerificationData storage data = verifications[tokenId];
-    data.participantType = participantType;
-    data.verificationDate = uint64(block.timestamp);
-    data.expirationDate = expirationDate;
-    data.jurisdiction = jurisdiction;
-    data.documentHash = documentHash;
-    data.investmentLimitUSD = investmentLimitUSD;
-    data.riskTolerance = riskTolerance; 
-    data.accreditationStatus = accreditationStatus;
-    data.isSanctioned = false;
-    
-    // Add all current registered platforms
-    // This ensures that any platforms registered after a user is verified
-    // won't automatically get access to their data
-    address[] storage platforms = data.allowedPlatforms;
-    for (uint i = 0; i < 10; i++) { // Limit platforms to prevent gas issues
-        // Pseudo implementation - in reality you'd use a mapping or array of registered platforms
-        address platformAddress = getPlatformAddressByIndex(i);
-        if (platformAddress == address(0)) break;
-        platforms.push(platformAddress);
-    }
-    
-    // Map the address to the token ID
-    addressToTokenIds[recipient].push(tokenId);
-    
-    emit ParticipantVerified(tokenId, recipient, participantType);
-    
-    return tokenId;
-}
-
-    
-    /**
-     * @dev Helper function to get platform addresses
-     * This is a simplified implementation - in a real system, you would
-     * likely use a mapping or array to store and retrieve platform addresses
-     */
-    function getPlatformAddressByIndex(uint256 _index) internal pure returns (address) {
-    // This is just a placeholder implementation
-    // You would need to replace this with your actual logic for retrieving
-    // registered platforms based on the index
-    return address(0);
-}
-
     
     /**
      * @dev Updates the compliance status of a participant
@@ -342,7 +353,7 @@ function _issueVerification(
         external 
         onlyRole(COMPLIANCE_ROLE) 
     {
-require(_ownerOf(tokenId) != address(0), "Token does not exist");
+        require(_ownerOf(tokenId) != address(0), "Token does not exist");
         
         verifications[tokenId].isSanctioned = isSanctioned;
         
@@ -354,7 +365,7 @@ require(_ownerOf(tokenId) != address(0), "Token does not exist");
      * @param tokenId Token ID to revoke
      */
     function revokeVerification(uint256 tokenId) external onlyRole(VERIFIER_ROLE) {
-require(_ownerOf(tokenId) != address(0), "Token does not exist");
+        require(_ownerOf(tokenId) != address(0), "Token does not exist");
         
         address owner = ownerOf(tokenId);
         
@@ -387,76 +398,76 @@ require(_ownerOf(tokenId) != address(0), "Token does not exist");
      * @return investmentLimit Maximum investment amount (for investors)
      * @return accreditation Accreditation status
      */
-function checkVerification(
-    address participant,
-    address platform,
-    ParticipantType requiredType
-) external view returns (
-    bool isVerified,
-    uint256 tokenId,
-    ParticipantType pType,
-    uint64 expiration,
-    uint32 investmentLimit,
-    AccreditationStatus accreditation
-) {
-    require(participant != address(0), "Invalid participant address");
-    
-    // Check if the platform is registered
-    if (!registeredPlatforms[platform]) {
+    function checkVerification(
+        address participant,
+        address platform,
+        ParticipantType requiredType
+    ) external view returns (
+        bool isVerified,
+        uint256 tokenId,
+        ParticipantType pType,
+        uint64 expiration,
+        uint32 investmentLimit,
+        AccreditationStatus accreditation
+    ) {
+        require(participant != address(0), "Invalid participant address");
+        
+        // Check if the platform is registered
+        if (!registeredPlatforms[platform]) {
+            return (false, 0, ParticipantType.Client, 0, 0, AccreditationStatus.Unspecified);
+        }
+        
+        // Get all tokens owned by this participant
+        uint256[] memory tokenIds = addressToTokenIds[participant];
+        
+        // Find a valid token for this platform and participant type
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            uint256 id = tokenIds[i];
+            
+            // Check if token exists (using _ownerOf instead of _exists)
+            if (_ownerOf(id) != address(0) && verifications[id].participantType == requiredType) {
+                VerificationData storage data = verifications[id];
+                
+                // Check if it's expired
+                bool expired = data.expirationDate != 0 && data.expirationDate < block.timestamp;
+                if (expired) {
+                    continue;
+                }
+                
+                // Check if participant is sanctioned
+                if (data.isSanctioned) {
+                    continue;
+                }
+                
+                // Check if platform is allowed
+                bool platformAllowed = false;
+                for (uint256 j = 0; j < data.allowedPlatforms.length; j++) {
+                    if (data.allowedPlatforms[j] == platform) {
+                        platformAllowed = true;
+                        break;
+                    }
+                }
+                
+                if (!platformAllowed) {
+                    continue;
+                }
+                
+                // Found a valid verification
+                return (
+                    true,
+                    id,
+                    data.participantType,
+                    data.expirationDate,
+                    data.investmentLimitUSD,
+                    data.accreditationStatus
+                );
+            }
+        }
+        
+        // No valid verification found
         return (false, 0, ParticipantType.Client, 0, 0, AccreditationStatus.Unspecified);
     }
     
-    // Get all tokens owned by this participant
-    uint256[] memory tokenIds = addressToTokenIds[participant];
-    
-    // Find a valid token for this platform and participant type
-    for (uint256 i = 0; i < tokenIds.length; i++) {
-        uint256 id = tokenIds[i];
-        
-        // Check if token exists (using _ownerOf instead of _exists)
-        if (_ownerOf(id) != address(0) && verifications[id].participantType == requiredType) {
-            VerificationData storage data = verifications[id];
-            
-            // Check if it's expired
-            bool expired = data.expirationDate != 0 && data.expirationDate < block.timestamp;
-            if (expired) {
-                continue;
-            }
-            
-            // Check if participant is sanctioned
-            if (data.isSanctioned) {
-                continue;
-            }
-            
-            // Check if platform is allowed
-            bool platformAllowed = false;
-            for (uint256 j = 0; j < data.allowedPlatforms.length; j++) {
-                if (data.allowedPlatforms[j] == platform) {
-                    platformAllowed = true;
-                    break;
-                }
-            }
-            
-            if (!platformAllowed) {
-                continue;
-            }
-            
-            // Found a valid verification
-            return (
-                true,
-                id,
-                data.participantType,
-                data.expirationDate,
-                data.investmentLimitUSD,
-                data.accreditationStatus
-            );
-        }
-    }
-    
-    // No valid verification found
-    return (false, 0, ParticipantType.Client, 0, 0, AccreditationStatus.Unspecified);
-}
-
     /**
      * @dev Gets the verification details for a specific token
      * @param tokenId The token ID to query
@@ -481,7 +492,7 @@ function checkVerification(
         AccreditationStatus accreditationStatus,
         bool isSanctioned
     ) {
-require(_ownerOf(tokenId) != address(0), "Token does not exist");
+        require(_ownerOf(tokenId) != address(0), "Token does not exist");
         
         VerificationData storage data = verifications[tokenId];
         
@@ -513,7 +524,7 @@ require(_ownerOf(tokenId) != address(0), "Token does not exist");
      * @return True if expired, false otherwise
      */
     function isExpired(uint256 tokenId) external view returns (bool) {
-require(_ownerOf(tokenId) != address(0), "Token does not exist");
+        require(_ownerOf(tokenId) != address(0), "Token does not exist");
         
         uint64 expiration = verifications[tokenId].expirationDate;
         
@@ -522,6 +533,14 @@ require(_ownerOf(tokenId) != address(0), "Token does not exist");
         }
         
         return block.timestamp > expiration;
+    }
+    
+    /**
+     * @dev Gets all registered platform addresses
+     * @return Array of registered platform addresses
+     */
+    function getRegisteredPlatforms() external view returns (address[] memory) {
+        return _registeredPlatformsList;
     }
     
     /**
